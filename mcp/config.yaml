@@ -1,0 +1,11 @@
+# mcp/config.yaml
+# MCP server configurations. Add entries to connect to MCP servers.
+#
+# Example:
+# servers:
+#   - name: filesystem
+#     transport: stdio
+#     command: npx
+#     args: ["-y", "@modelcontextprotocol/server-filesystem", "."]
+
+servers: []

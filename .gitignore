@@ -1,0 +1,11 @@
+.env
+__pycache__/
+*.pyc
+.venv/
+.sessions/
+.agent_memory.md
+.agent_tasks.json
+.mailboxes/
+.mcp_connections/
+dist/
+*.egg-info/
