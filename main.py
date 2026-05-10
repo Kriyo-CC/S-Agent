@@ -15,7 +15,6 @@ Usage:
   python main.py --task "list files"    # Run a single task (non-interactive)
 """
 
-import os
 import sys
 import asyncio
 from datetime import datetime
@@ -28,6 +27,7 @@ from config.settings import client, MODEL, load_rules
 from agent.events import EventBus
 from agent.loop import stream_loop
 from agent.context import maybe_compress
+from agent.prompt import build_system_prompt
 from agent.session import (
     create_session,
     save_session,
@@ -39,6 +39,7 @@ from agent.session import (
 from tools.registry import ToolRegistry
 from tools.bash import register_bash_tool
 from tools.file_ops import register_file_tools
+from tools.ledger import register_ledger_tools
 from tools.skill import register_skill_tools, discover_skills
 from tools.subagent import register_subagent_tool
 
@@ -93,26 +94,6 @@ def _hook_timer():
     return hook
 
 
-# ── Build system prompt ─────────────────────────────────
-
-
-def build_system_prompt() -> str:
-    """Construct the system prompt with dynamic skill index."""
-    skills = discover_skills()
-    skill_index = (
-        "\n".join(f"  - {n}: {d}" for n, d in skills.items())
-        or "  (none installed)"
-    )
-
-    return (
-        f"You are a coding agent at {os.getcwd()}.\n"
-        "You have access to local tools, MCP tools, and specialized Skills.\n"
-        "- For complex/exploratory subtasks, use spawn_subagent to delegate.\n"
-        "- For domain knowledge, call list_skills then load_skill(name).\n"
-        "- MCP tools are prefixed mcp__<server>__<tool>.\n"
-        "Always prefer structured file tools (read/write/grep/glob) over raw bash.\n\n"
-        f"Available Skills:\n{skill_index}"
-    )
 
 
 # ── Async MCP initialization ────────────────────────────
@@ -223,6 +204,7 @@ async def main_async() -> None:
     registry = ToolRegistry()
     register_bash_tool(registry)
     register_file_tools(registry)
+    register_ledger_tools(registry)
     register_skill_tools(registry)
 
     # MCP tools (async init)
@@ -230,9 +212,6 @@ async def main_async() -> None:
 
     # Subagent tool (needs full registry for recursive use)
     register_subagent_tool(registry, registry.list_schemas(), registry._handlers)
-
-    # ── Build system prompt ─────────────────────────────
-    system = build_system_prompt()
 
     # ── CLI startup ─────────────────────────────────────
     print(
@@ -285,7 +264,7 @@ async def main_async() -> None:
             stream_loop(
                 messages=session["messages"],
                 registry=registry,
-                system=system,
+                system=build_system_prompt(),  # rebuild each turn for fresh UserSpace context
                 bus=bus,
                 use_permissions=True,
                 mcp_executor=mcp_exec,
