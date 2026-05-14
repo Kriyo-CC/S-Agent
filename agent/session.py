@@ -9,6 +9,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import List, Dict, Any, Optional
 
+from cli.render import console
+
 SESSIONS_DIR = Path(".sessions")
 SESSIONS_DIR.mkdir(exist_ok=True)
 
@@ -59,7 +61,7 @@ def load_session(session_id: str) -> Optional[Dict[str, Any]]:
             try:
                 return json.loads(f.read_text(encoding="utf-8"))
             except (json.JSONDecodeError, IOError) as e:
-                print(f"\033[31m  [error] Failed to load session: {e}\033[0m")
+                console.print(f"[red]  [error] Failed to load session: {e}[/red]")
                 return None
     return None
 
@@ -84,13 +86,13 @@ def print_sessions_table() -> None:
     """Print a formatted table of saved sessions."""
     sessions = list_sessions()
     if not sessions:
-        print("  (No saved sessions found)")
+        console.print("  (No saved sessions found)")
         return
-    print("\n  \033[4mID        LAST UPDATED         TITLE (MESSAGES)\033[0m")
+    console.print("\n  [underline]ID        LAST UPDATED         TITLE (MESSAGES)[/underline]")
     for s in sessions:
         mc = len(s.get("messages", []))
-        print(
-            f"  \033[36m{s['id']}\033[0m  {s['updated'][:19]}  "
-            f"{s['title'][:40]:40} \033[90m({mc} msgs)\033[0m"
+        console.print(
+            f"  [cyan]{s['id']}[/cyan]  {s['updated'][:19]}  "
+            f"{s['title'][:40]:40} [dim]({mc} msgs)[/dim]"
         )
-    print()
+    console.print()

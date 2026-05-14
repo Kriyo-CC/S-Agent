@@ -8,12 +8,30 @@ until the model produces a final answer.
 import os
 from typing import List, Dict, Any, Optional, Callable
 
-from config.settings import client, MODEL, check_permission, load_rules
+from config.settings import check_permission, load_rules
 from agent.events import EventBus
+from agent.types import AgentContext
+from agent.accounting import SessionAccounting
+from cli.render import console
 from tools.registry import ToolRegistry
 
 
-def dispatch_tools(
+def _extract_input_summary(tool_input: dict, tool_name: str) -> str:
+    """Extract a meaningful value from tool_input for display or permission checks.
+
+    Prefers the most semantically important key (command, pattern, path, etc.)
+    rather than relying on dict iteration order which may surface flags/booleans.
+    Falls back to tool_name if input is empty.
+    """
+    if not tool_input:
+        return tool_name
+    for key in ("command", "pattern", "path", "prompt", "content"):
+        if key in tool_input:
+            return str(tool_input[key])
+    return str(next(iter(tool_input.values())))
+
+
+async def dispatch_tools(
     response_content: list,
     registry: ToolRegistry,
     bus: Optional[EventBus] = None,
@@ -43,7 +61,7 @@ def dispatch_tools(
         tool_use_id = block.id
 
         # ── Pre-tool event & permission check ────────────
-        first_val = str(list(tool_input.values())[0])[:80] if tool_input else ""
+        first_val = _extract_input_summary(tool_input, tool_name)[:80]
 
         if bus:
             pre_results = bus.emit(
@@ -62,11 +80,10 @@ def dispatch_tools(
                 continue
 
         if use_permissions:
-            check_str = (
-                str(list(tool_input.values())[0]) if tool_input else tool_name
-            )
+            check_str = _extract_input_summary(tool_input, tool_name)
             allowed, reason = check_permission(tool_name, check_str, rules)
             if not allowed:
+                console.print(f"[red][DENIED] {reason}[/red]")
                 output = (
                     f"Blocked by Permission Policy: {check_str[:80]} "
                     f"(Reason: {reason})"
@@ -78,15 +95,13 @@ def dispatch_tools(
                 })
                 continue
 
-        print(f"\033[33m[{tool_name}] {first_val}...\033[0m")
+        console.print(f"[yellow]{tool_name}[/yellow] {first_val}...")
 
         # ── Execute tool ─────────────────────────────────
-        # MCP tools need special async handling
+        # MCP tools need async execution
         if mcp_executor and tool_name.startswith("mcp__"):
             try:
-                import asyncio
-
-                output = asyncio.run(mcp_executor(tool_name, tool_input))
+                output = await mcp_executor(tool_name, tool_input)
             except Exception as e:
                 output = f"Error during MCP execution: {e}"
         else:
@@ -99,7 +114,7 @@ def dispatch_tools(
             else:
                 output = f"Error: Unknown tool '{tool_name}'"
 
-        print(str(output)[:300])
+        console.print(output[:300])
 
         if bus:
             bus.emit(
@@ -118,15 +133,17 @@ def dispatch_tools(
     return results
 
 
-def stream_loop(
+async def stream_loop(
     messages: List[Dict[str, Any]],
     registry: ToolRegistry,
     system: Optional[str] = None,
+    ctx: Optional[AgentContext] = None,
     model: Optional[str] = None,
     bus: Optional[EventBus] = None,
     use_permissions: bool = True,
     mcp_executor: Optional[Callable] = None,
     extra_kwargs: Optional[Dict[str, Any]] = None,
+    accounting: Optional[SessionAccounting] = None,
 ) -> Any:
     """Main agent loop: stream + dispatch until the model finishes.
 
@@ -134,7 +151,8 @@ def stream_loop(
         messages: The rolling conversation history (modified in-place).
         registry: ToolRegistry with schemas and handlers.
         system: System prompt.
-        model: Model ID override.
+        ctx: Optional AgentContext for dependency injection.
+        model: Model ID override (takes precedence over ctx.model).
         bus: Optional EventBus for lifecycle events.
         use_permissions: Whether to apply permission checks.
         mcp_executor: Optional async MCP tool executor.
@@ -143,15 +161,21 @@ def stream_loop(
     Returns:
         The final API response Message object.
     """
+    # Resolve client and model: explicit params > AgentContext > defaults
+    _client = ctx.client if ctx else None
+    model_id = model or (ctx.model if ctx else None) or "claude-sonnet-4-20250514"
+    _bus = bus or (ctx.bus if ctx else None)
+    _use_permissions = use_permissions
+    _mcp_executor = mcp_executor or (ctx.mcp_executor if ctx else None)
+
     system = system or f"You are a coding agent at {os.getcwd()}. Use tools to solve tasks."
-    model_id = model or MODEL
     extra_kwargs = extra_kwargs or {}
 
     while True:
-        print("\n\033[36m> Thinking...\033[0m")
+        console.print("\n[cyan]> Thinking...[/cyan]")
 
         try:
-            with client.messages.stream(
+            with _client.messages.stream(
                 model=model_id,
                 system=system,
                 messages=messages,
@@ -162,26 +186,33 @@ def stream_loop(
                 for text in stream.text_stream:
                     print(text, end="", flush=True)
                 response = stream.get_final_message()
+
+                # Record token usage if accounting is active
+                if accounting and response.usage:
+                    accounting.record_turn(
+                        input_tokens=response.usage.input_tokens or 0,
+                        output_tokens=response.usage.output_tokens or 0,
+                    )
         except Exception as e:
-            print(f"\n\033[31m[Error] API call failed: {e}\033[0m")
+            console.print(f"\n[red][Error] API call failed: {e}[/red]")
             raise
 
         print()
         messages.append({"role": "assistant", "content": response.content})
 
-        if bus:
+        if _bus:
             text_content = "".join(
                 block.text
                 for block in response.content
                 if hasattr(block, "text")
             )
             if text_content:
-                bus.emit("agent_response", text=text_content)
+                _bus.emit("agent_response", text=text_content)
 
         if response.stop_reason != "tool_use":
             return response
 
-        results = dispatch_tools(
-            response.content, registry, bus, use_permissions, mcp_executor
+        results = await dispatch_tools(
+            response.content, registry, _bus, _use_permissions, _mcp_executor
         )
         messages.append({"role": "user", "content": results})

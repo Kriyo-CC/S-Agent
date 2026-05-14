@@ -1,16 +1,16 @@
-"""File operation tools: read, write, grep, glob, revert.
+"""File operation tools: read, write, edit, grep, glob, revert.
 
-Every write automatically snapshots the previous content so 'revert' can undo.
+Write and Edit automatically snapshot previous content so revert can undo.
+Snapshots are saved to .snapshots/ via tools/snapshot.py (persistent).
 """
 
 import os
 import glob as _glob
 import subprocess
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Optional
 
-# In-memory snapshot store: {path: previous_content_or_None}
-_SNAPSHOTS: Dict[str, Optional[str]] = {}
+from tools.snapshot import save_snapshot, restore_snapshot, has_snapshot
 
 # ── Read ────────────────────────────────────────────────
 
@@ -45,16 +45,55 @@ def run_write(path: str, content: str) -> str:
     try:
         if os.path.exists(path):
             with open(path, "r", encoding="utf-8", errors="replace") as f:
-                _SNAPSHOTS[path] = f.read()
+                prev = f.read()
+            save_snapshot(path, prev)
             action = "updated"
         else:
-            _SNAPSHOTS[path] = None
+            save_snapshot(path, None)  # new file, no previous content
             action = "created"
 
         os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
         with open(path, "w", encoding="utf-8") as f:
             f.write(content)
-        return f"{action}: {path} (snapshot saved — use revert to undo)"
+        return f"{action}: {path}"
+    except Exception as e:
+        return f"Error writing {path}: {e}"
+
+
+# ── Edit ────────────────────────────────────────────────
+
+
+def run_edit(path: str, old_string: str, new_string: str) -> str:
+    """Edit a file by replacing exactly one occurrence of old_string.
+
+    Fails with a clear message if old_string is not found (0 matches)
+    or if it appears multiple times (>1 matches).
+
+    Snapshots the file before making any change.
+    """
+    try:
+        content = Path(path).read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return f"Error: file not found: {path}"
+    except Exception as e:
+        return f"Error reading {path}: {e}"
+
+    count = content.count(old_string)
+    if count == 0:
+        return "Error: string not found. Ensure the exact string appears in the file."
+    if count > 1:
+        return (
+            f"Error: found {count} occurrences of the string. "
+            "Please include more surrounding context to make the match unique."
+        )
+
+    # Snapshot before editing
+    save_snapshot(path, content)
+
+    content = content.replace(old_string, new_string, 1)
+    try:
+        Path(path).write_text(content, encoding="utf-8")
+        return f"edited: {path}"
     except Exception as e:
         return f"Error writing {path}: {e}"
 
@@ -63,25 +102,41 @@ def run_write(path: str, content: str) -> str:
 
 
 def run_grep(pattern: str, path: str = ".", recursive: bool = True) -> str:
-    """Search for a regex pattern in files."""
+    """Search for a regex pattern in files.
+
+    Uses ripgrep (rg) if available, falls back to system grep.
+    """
+    recursive_flag = ["-r"] if recursive else []
+
+    # Try ripgrep first (faster, respects .gitignore)
     try:
-        flags = ["-r"] if recursive else []
         result = subprocess.run(
-            ["grep", "-n", *flags, pattern, path],
+            ["rg", "-n", *recursive_flag, pattern, path],
             capture_output=True,
             text=True,
             timeout=30,
         )
-        return ((result.stdout + result.stderr).strip() or "(no matches)")[:10000]
+        output = (result.stdout + result.stderr).strip()
+        return output[:10000] if output else "(no matches)"
     except FileNotFoundError:
-        try:
-            cmd = f'findstr /S /N "{pattern}" "{path}\\*.py" "{path}\\*.js" "{path}\\*.md"'
-            result = subprocess.run(
-                cmd, shell=True, capture_output=True, text=True, timeout=30
-            )
-            return ((result.stdout + result.stderr).strip() or "(no matches)")[:10000]
-        except Exception as e:
-            return f"Error: grep/findstr failed: {e}"
+        pass  # rg not installed, fall through to grep
+    except subprocess.TimeoutExpired:
+        return "Error: rg timeout"
+    except Exception:
+        pass
+
+    # Fallback: system grep
+    try:
+        result = subprocess.run(
+            ["grep", "-n", *recursive_flag, pattern, path],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        output = (result.stdout + result.stderr).strip()
+        return output[:10000] if output else "(no matches)"
+    except FileNotFoundError:
+        return "Error: neither rg nor grep found on system"
     except subprocess.TimeoutExpired:
         return "Error: grep timeout"
     except Exception as e:
@@ -103,11 +158,11 @@ def run_glob(pattern: str) -> str:
 
 
 def run_revert(path: str) -> str:
-    """Undo the last write to a file by restoring the snapshot."""
-    if path not in _SNAPSHOTS:
+    """Undo the last write/edit to a file by restoring the snapshot."""
+    if not has_snapshot(path):
         return f"Error: no snapshot for {path}"
 
-    original = _SNAPSHOTS.pop(path)
+    original = restore_snapshot(path)
 
     if original is None:
         try:
@@ -158,8 +213,35 @@ def register_file_tools(registry) -> None:
         handler=lambda inp: run_write(inp["path"], inp["content"]),
     )
     registry.register(
+        name="edit",
+        description=(
+            "Edit a file by replacing exactly one occurrence of old_string "
+            "with new_string. Fails if 0 or >1 matches. Use this instead of "
+            "write+read for targeted changes — it's more reliable than "
+            "matching on line numbers."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "Path to the file to edit."},
+                "old_string": {
+                    "type": "string",
+                    "description": "The exact existing text to replace (must match exactly once).",
+                },
+                "new_string": {
+                    "type": "string",
+                    "description": "The new text to insert in place of old_string.",
+                },
+            },
+            "required": ["path", "old_string", "new_string"],
+        },
+        handler=lambda inp: run_edit(
+            inp["path"], inp["old_string"], inp["new_string"]
+        ),
+    )
+    registry.register(
         name="grep",
-        description="Search for a regex pattern in files under a path.",
+        description="Search for a regex pattern in files under a path. Uses ripgrep if available.",
         input_schema={
             "type": "object",
             "properties": {
@@ -185,7 +267,10 @@ def register_file_tools(registry) -> None:
     )
     registry.register(
         name="revert",
-        description="Restore a file to its state before the last write.",
+        description=(
+            "Restore a file to its state before the last write or edit. "
+            "Uses persistent on-disk snapshots (undo works across restarts)."
+        ),
         input_schema={
             "type": "object",
             "properties": {"path": {"type": "string"}},

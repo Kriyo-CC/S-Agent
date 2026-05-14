@@ -6,6 +6,7 @@
 
 # ── 1. EventBus 基础 ─────────────────────────────────────
 
+import asyncio
 from agent.events import EventBus
 
 bus = EventBus()
@@ -92,7 +93,7 @@ class FakeToolUse:
     id = "fake-1"
 
 
-results = dispatch_tools([FakeToolUse], registry, dispatch_bus, use_permissions=False)
+results = asyncio.run(dispatch_tools([FakeToolUse], registry, dispatch_bus, use_permissions=False))
 
 assert len(pre_log) == 1 and pre_log[0] == "list_skills"
 assert len(post_log) == 1 and post_log[0][0] == "list_skills"
@@ -112,7 +113,7 @@ tmp.close()
 from tools.file_ops import run_write, run_revert
 
 out = run_write(tmp.name, "new content")
-assert "snapshot saved" in out, f"Unexpected write output: {out}"
+assert out.startswith("updated:"), f"Unexpected write output: {out}"
 out = run_revert(tmp.name)
 assert "reverted" in out, f"Unexpected revert output: {out}"
 with open(tmp.name) as f:
@@ -177,6 +178,28 @@ assert counts["bash"] == 1
 
 stats_bus.emit("session_end")
 print(f"[PASS] stats hook: {dict(counts)}")
+
+# ── 8. ToolRegistry.get_handlers() returns copy of handlers ──────
+
+reg2 = ToolRegistry()
+
+# empty registry
+assert reg2.get_handlers() == {}, f"Expected empty dict, got {reg2.get_handlers()}"
+
+# after registration
+def dummy():
+    pass
+
+reg2.register("test_tool", "A test tool", {"type": "object", "properties": {}}, dummy)
+handlers = reg2.get_handlers()
+assert "test_tool" in handlers
+assert handlers["test_tool"] is dummy
+
+# verify it's a copy (mutating returned dict does not affect registry)
+handlers["injected"] = "bad"
+assert "injected" not in reg2._handlers, "get_handlers() must return a copy"
+
+print("[PASS] ToolRegistry.get_handlers() returns a copy of _handlers")
 
 # ── Summary ──────────────────────────────────────────────
 

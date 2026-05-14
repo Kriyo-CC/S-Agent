@@ -11,6 +11,8 @@ from typing import Dict, List, Tuple
 
 import yaml
 
+from cli.render import console
+
 _CONFIG_PATH = Path(__file__).parent / "config.yaml"
 
 # Lazy imports for optional MCP dependency
@@ -42,15 +44,15 @@ class MCPClient:
         try:
             config = yaml.safe_load(_CONFIG_PATH.read_text(encoding="utf-8"))
         except Exception as e:
-            print(f"\033[31m  [MCP] Failed to parse config: {e}\033[0m")
+            console.print(f"[red]  [MCP] Failed to parse config: {e}[/red]")
             return []
         return config.get("servers") or []
 
     async def connect(self) -> List[dict]:
         """Connect to all configured MCP servers and return discovered tool schemas."""
         if not MCP_AVAILABLE:
-            print(
-                "\033[33mWarning: 'mcp' package not found. Run: pip install mcp\033[0m"
+            console.print(
+                "[yellow]Warning: 'mcp' package not found. Run: pip install mcp[/yellow]"
             )
             return []
 
@@ -63,8 +65,8 @@ class MCPClient:
             server_name = srv_cfg.get("name", "unnamed")
             try:
                 if srv_cfg.get("transport", "stdio") != "stdio":
-                    print(
-                        f"\033[33m  [MCP] {server_name}: unsupported transport\033[0m"
+                    console.print(
+                        f"[yellow]  [MCP] {server_name}: unsupported transport[/yellow]"
                     )
                     continue
 
@@ -83,8 +85,8 @@ class MCPClient:
                 tool_list = mcp_resp.tools
 
                 self._sessions[server_name] = session
-                print(
-                    f"\033[90m  [MCP] {server_name}: Connected ({len(tool_list)} tools)\033[0m"
+                console.print(
+                    f"[dim]  [MCP] {server_name}: Connected ({len(tool_list)} tools)[/dim]"
                 )
 
                 for tool in tool_list:
@@ -97,8 +99,8 @@ class MCPClient:
                         or {"type": "object", "properties": {}},
                     })
             except Exception as e:
-                print(
-                    f"\033[31m  [MCP] Failed to connect to '{server_name}': {e}\033[0m"
+                console.print(
+                    f"[red]  [MCP] Failed to connect to '{server_name}': {e}[/red]"
                 )
 
         return discovered

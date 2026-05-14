@@ -17,7 +17,7 @@ always_deny:
     reason: "Pipe-to-shell downloads blocked"
 
 always_allow:
-  - pattern: "^ls( |$|$)"
+  - pattern: "^ls( |$)"
     reason: "Directory listing is always safe"
   - pattern: "^cat "
     reason: "Reading files is always safe"

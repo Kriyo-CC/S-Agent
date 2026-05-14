@@ -37,6 +37,10 @@ class ToolRegistry:
     def get_handler(self, name: str) -> Optional[Callable]:
         return self._handlers.get(name)
 
+    def get_handlers(self) -> Dict[str, Callable]:
+        """Return a copy of all handler mappings."""
+        return dict(self._handlers)
+
     def list_schemas(self) -> List[Dict[str, Any]]:
         """Return all tool schemas as a list for the Anthropic API."""
         return list(self._tools.values())

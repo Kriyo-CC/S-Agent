@@ -12,6 +12,8 @@ Events fired:
 from collections import defaultdict
 from typing import Dict, List, Callable, Any
 
+from cli.render import console
+
 
 class EventBus:
     """A simple Pub/Sub event system to manage agent lifecycle hooks."""
@@ -33,7 +35,7 @@ class EventBus:
                 if result is not None:
                     results.append(result)
             except Exception as e:
-                print(f"\033[31m[EventBus] Hook error on '{event}': {e}\033[0m")
+                console.print(f"[red][EventBus] Hook error on '{event}': {e}[/red]")
         return results
 
     def remove(self, event: str, handler: Callable) -> None:

@@ -9,3 +9,5 @@ __pycache__/
 .mcp_connections/
 dist/
 *.egg-info/
+*.txt
+.claude

@@ -42,21 +42,7 @@ main.py (297 lines)
 | `config/settings.py` global state | Module-level `client`, `MODEL` | Can't mock, can't multi-session |
 | `main.py` does everything | Single monolithic file | Hard to test, hard to extend |
 
-## 3. Architectural Approaches Considered
-
-### 3.1 Approach A: Incremental Cleanup (Minimal Restructuring)
-
-Keep existing structure intact, upgrade components one by one in-place.
-
-- `main.py` stays whole, `print()` replaced with Rich calls
-- Tools upgraded in-place (Bash gets shlex, Edit added, grep gets ripgrep)
-- `memory/` and `agents/` added as new directories
-- Accounting injected as EventBus hook
-
-**Pros:** Lowest risk, easy merge path for parallel work, any step can be rolled back independently.
-**Cons:** `main.py` remains a 300+ line orchestrator; `print()` -> Rich replacement must touch every file; EventBus hooks are coupled to implementation details.
-
-### 3.2 Approach B: Layered Architecture (Recommended)
+## 3. Chosen Architecture: Layered Architecture (Approach B)
 
 Refactor into four distinct layers with well-defined boundaries:
 
@@ -70,21 +56,7 @@ Refactor into four distinct layers with well-defined boundaries:
 **Pros:** Clean separation of concerns; each layer can be understood and tested independently; standard Python package structure for future extensions; dependency injection makes mocking simple.
 **Cons:** Git history disruption due to file moves; requires one atomic large-refactor commit; backward compatibility with existing sessions needs explicit handling.
 
-### 3.3 Approach C: Microkernel / Plugin Architecture
-
-Core runtime dispatches tool calls and manages events; everything else is a independently-loaded plugin.
-
-- Each tool is its own Python package with `tool.yaml` metadata
-- Agent definitions are plugins with YAML frontmatter
-- CLI is itself a plugin
-- Registry acts as kernel
-
-**Pros:** Maximum modularity and extensibility; third-party tools as plugins.
-**Cons:** Heavily over-engineered for a single-user CLI tool; YAGNI violation; dynamic discovery at load time adds complexity with no tangible benefit.
-
-### 3.4 Recommendation: Approach B
-
-This is the best ROI point. It solves all listed problems (monolithic main.py, print() scattered, low-quality tools) without the meta-programming overhead of a plugin system. The layers map to natural concerns -- a new contributor can look at `cli/`, `agent/`, or `tools/` without understanding the entire codebase.
+This approach solves all listed problems (monolithic main.py, print() scattered, low-quality tools) without the meta-programming overhead of a plugin system. The layers map to natural concerns — a new contributor can look at `cli/`, `agent/`, or `tools/` without understanding the entire codebase.
 
 ## 4. Target Architecture
 

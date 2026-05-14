@@ -8,9 +8,10 @@ Implements a 3-layer strategy:
 
 import os
 from pathlib import Path
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 
-from config.settings import client, MODEL
+from agent.types import AgentContext
+from cli.render import console
 
 COMPRESS_THRESHOLD = 40_000  # chars
 KEEP_RECENT = 6  # messages
@@ -35,7 +36,7 @@ def _estimate_size(messages: List[Dict[str, Any]]) -> int:
     return total
 
 
-def _summarize(messages: List[Dict[str, Any]]) -> str:
+def _summarize(messages: List[Dict[str, Any]], ctx: AgentContext) -> str:
     """Use the LLM to condense history into a concise summary."""
     text = "\n\n".join(
         f"[{m['role']}]: "
@@ -50,8 +51,8 @@ def _summarize(messages: List[Dict[str, Any]]) -> str:
         for m in messages
     )
 
-    response = client.messages.create(
-        model=MODEL,
+    response = ctx.client.messages.create(
+        model=ctx.model,
         system=(
             "You are a context compressor. Summarize the conversation history. "
             "Retain critical decisions, file paths, code changes, and pending tasks. "
@@ -67,8 +68,14 @@ def _summarize(messages: List[Dict[str, Any]]) -> str:
     )
 
 
-def maybe_compress(messages: List[Dict[str, Any]]) -> bool:
+def maybe_compress(
+    messages: List[Dict[str, Any]], ctx: Optional[AgentContext] = None
+) -> bool:
     """Check if compression is needed and perform it in-place.
+
+    Args:
+        messages: The conversation history (modified in-place).
+        ctx: AgentContext with client/model for summarization.
 
     Returns True if compression occurred.
     """
@@ -77,11 +84,15 @@ def maybe_compress(messages: List[Dict[str, Any]]) -> bool:
     if len(messages) <= KEEP_RECENT:
         return False
 
-    print("\033[90m  [compress] Context large — condensing older history...\033[0m")
+    console.print("[dim]  [compress] Context large — condensing older history...[/dim]")
     old = messages[:-KEEP_RECENT]
     recent = messages[-KEEP_RECENT:]
 
-    summary = _summarize(old)
+    if not ctx:
+        console.print("[yellow]Warning: no compression, no AgentContext provided[/yellow]")
+        return False
+
+    summary = _summarize(old, ctx)
 
     try:
         MEMORY_FILE.write_text(
@@ -89,7 +100,7 @@ def maybe_compress(messages: List[Dict[str, Any]]) -> bool:
             encoding="utf-8",
         )
     except Exception as e:
-        print(f"\033[31m  [error] Failed to persist memory: {e}\033[0m")
+        console.print(f"[red]  [error] Failed to persist memory: {e}[/red]")
 
     messages.clear()
     messages.append({
@@ -102,7 +113,7 @@ def maybe_compress(messages: List[Dict[str, Any]]) -> bool:
     })
     messages.extend(recent)
 
-    print(
-        f"\033[90m  [compress] Done. Collapsed {len(old)} messages into 1 summary.\033[0m"
+    console.print(
+        f"[dim]  [compress] Done. Collapsed {len(old)} messages into 1 summary.[/dim]"
     )
     return True
