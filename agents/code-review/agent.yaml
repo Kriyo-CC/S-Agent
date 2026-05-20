@@ -1,6 +1,5 @@
 name: code-review
 description: "Performs thorough code review on patches and suggests improvements"
-model: claude-sonnet-4-20250514
 allowed_tools:
   - read
   - grep

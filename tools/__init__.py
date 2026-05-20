@@ -2,6 +2,10 @@
 
 All tools are registered into a ToolRegistry. New tools can be added by
 creating a module with a `register_<name>_tool(registry)` function.
+
+Exports:
+- ToolRegistry: Central tool management with metadata support
+- ToolError hierarchy: Structured error types for concurrent dispatch
 """
 
 from tools.registry import ToolRegistry
@@ -10,6 +14,19 @@ from tools.file_ops import register_file_tools
 from tools.ledger import register_ledger_tools
 from tools.skill import register_skill_tools, discover_skills
 from tools.subagent import register_subagent_tool
+
+# Re-export error types for convenience
+from tools.errors import (
+    ToolError,
+    ToolTimeoutError,
+    ToolExecutionError,
+    ToolNotFoundError,
+    ToolPermissionDeniedError,
+    ToolBlockedError,
+    ToolInputValidationError,
+    is_transient,
+    error_to_result,
+)
 
 
 def build_default_registry() -> ToolRegistry:

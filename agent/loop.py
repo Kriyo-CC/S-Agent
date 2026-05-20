@@ -1,10 +1,20 @@
-"""Core agent loop: streaming + tool dispatch with event emission.
+"""Core agent loop: streaming + concurrent tool dispatch with event emission.
 
 This is the heart of the agent — the Thinking-Acting cycle that calls the LLM,
-streams text to the terminal, executes tools, feeds results back, and repeats
-until the model produces a final answer.
+streams text to the terminal, executes tools concurrently, feeds results back,
+and repeats until the model produces a final answer.
+
+Concurrency model (enterprise-grade):
+- Independent tool_use blocks from a single model response execute concurrently
+  via asyncio.gather(return_exceptions=True).
+- One tool's failure never cancels sibling tools (error isolation).
+- User cancellation (Ctrl+C) propagates CancelledError to cancel all in-flight tools.
+- Sync tool handlers run in the default thread pool (asyncio.to_thread) to avoid
+  blocking the event loop.
+- Per-tool timeout via asyncio.wait_for prevents hung tools from stalling the agent.
 """
 
+import asyncio
 import os
 from typing import List, Dict, Any, Optional, Callable
 
@@ -14,6 +24,19 @@ from agent.types import AgentContext
 from agent.accounting import SessionAccounting
 from cli.render import console
 from tools.registry import ToolRegistry
+from tools.errors import (
+    ToolTimeoutError,
+    ToolExecutionError,
+    ToolNotFoundError,
+    ToolPermissionDeniedError,
+    ToolBlockedError,
+    ToolInputValidationError,
+    error_to_result,
+)
+
+# ── Default per-tool timeout (generous safety net; internal tool
+#    timeouts like bash's 120s subprocess timeout fire first) ────
+DEFAULT_TOOL_TIMEOUT = 300.0  # seconds
 
 
 def _extract_input_summary(tool_input: dict, tool_name: str) -> str:
@@ -31,14 +54,248 @@ def _extract_input_summary(tool_input: dict, tool_name: str) -> str:
     return str(next(iter(tool_input.values())))
 
 
+def _classify_tool_block(
+    block,
+    registry: ToolRegistry,
+    bus: Optional[EventBus],
+    rules: Optional[list],
+    use_permissions: bool,
+    mcp_executor: Optional[Callable],
+) -> tuple:
+    """Pre-flight checks for a single tool_use block.
+
+    Determines whether a block should be executed, and if not, why not.
+    This runs synchronously before any tool execution starts so that
+    permission denials and hook blocks are surfaced immediately.
+
+    Returns:
+        (status, error_message, handler) where status is one of:
+        'executable', 'blocked', 'denied', 'unknown', 'invalid_input'
+    """
+    tool_name = block.name
+    tool_input = block.input if isinstance(block.input, dict) else {}
+    tool_use_id = block.id
+
+    # ── Input type validation ──
+    if not isinstance(block.input, dict) and block.input is not None:
+        return (
+            "invalid_input",
+            ToolInputValidationError(
+                f"Invalid input type for '{tool_name}': "
+                f"expected dict, got {type(block.input).__name__}"
+            ),
+            None,
+        )
+
+    # ── System hook check (pre_tool_use event) ──
+    if bus:
+        pre_results = bus.emit("pre_tool_use", tool=tool_name, input=tool_input)
+        is_blocked = any(
+            r.get("block") for r in pre_results if isinstance(r, dict)
+        )
+        if is_blocked:
+            return (
+                "blocked",
+                ToolBlockedError(
+                    f"Tool '{tool_name}' execution blocked by system hook"
+                ),
+                None,
+            )
+
+    # ── Permission check ──
+    if use_permissions:
+        check_str = _extract_input_summary(tool_input, tool_name)
+        allowed, reason = check_permission(tool_name, check_str, rules)
+        if not allowed:
+            console.print(f"[red][DENIED] {reason}[/red]")
+            return (
+                "denied",
+                ToolPermissionDeniedError(
+                    f"{check_str[:80]} (Reason: {reason})"
+                ),
+                None,
+            )
+
+    # ── Handler lookup ──
+    handler = registry.dispatch(tool_name)
+    is_mcp = mcp_executor and tool_name.startswith("mcp__")
+    if handler is None and not is_mcp:
+        return (
+            "unknown",
+            ToolNotFoundError(f"Unknown tool '{tool_name}'"),
+            None,
+        )
+
+    return ("executable", None, handler)
+
+
+def _detect_write_conflicts(tool_specs: list) -> set:
+    """Detect concurrent modifications to the same file path.
+
+    When multiple write/edit/revert tools target the same file, concurrent
+    execution produces unpredictable results (last-write-wins). This function
+    identifies conflicting groups so the dispatcher can serialize them.
+
+    Args:
+        tool_specs: List of (original_index, block, handler, status, error_msg) tuples
+                    where status == 'executable'.
+
+    Returns:
+        Set of file paths that have conflicts (2+ tools targeting them).
+    """
+    write_tools = {"write", "edit", "revert"}
+    path_counts: Dict[str, int] = {}
+
+    for _idx, block, _handler, _status, _error_msg in tool_specs:
+        if block.name not in write_tools:
+            continue
+        tool_input = block.input if isinstance(block.input, dict) else {}
+        target_path = tool_input.get("path", "")
+        if target_path:
+            path_counts[target_path] = path_counts.get(target_path, 0) + 1
+
+    return {path for path, count in path_counts.items() if count > 1}
+
+
+async def _execute_single_tool(
+    tool_name: str,
+    tool_input: dict,
+    tool_use_id: str,
+    handler: Optional[Callable],
+    *,
+    mcp_executor: Optional[Callable] = None,
+    timeout: float = DEFAULT_TOOL_TIMEOUT,
+    bus: Optional[EventBus] = None,
+) -> Dict[str, Any]:
+    """Execute one tool with comprehensive error handling.
+
+    This is the atomic unit of concurrent execution. It handles all failure
+    modes for a single tool invocation and always returns a tool_result dict
+    (never raises Exception). The only exception that propagates is
+    asyncio.CancelledError, which signals a user interrupt and must cancel
+    all sibling tasks.
+
+    Args:
+        tool_name: Name of the tool to execute.
+        tool_input: Input dict (already validated as a dict).
+        tool_use_id: The tool_use block ID from the API response.
+        handler: Callable from the registry (may be None for MCP tools).
+        mcp_executor: Optional async callable for MCP tool execution.
+        timeout: Per-tool timeout in seconds.
+        bus: Optional EventBus for post_tool_use events.
+
+    Returns:
+        A tool_result dict with 'type', 'tool_use_id', and 'content' keys.
+    """
+    # ── Execute with structured error handling ──
+    error: Optional[ToolError] = None
+    output: str = ""
+
+    try:
+        if mcp_executor and tool_name.startswith("mcp__"):
+            # MCP tools: native async
+            output = await asyncio.wait_for(
+                mcp_executor(tool_name, tool_input),
+                timeout=timeout,
+            )
+        elif handler is not None:
+            if asyncio.iscoroutinefunction(handler):
+                # Async tool handler
+                output = await asyncio.wait_for(
+                    handler(tool_input),
+                    timeout=timeout,
+                )
+            else:
+                # Sync tool handler → run in default thread pool to
+                # avoid blocking the event loop during I/O or subprocess calls
+                output = await asyncio.wait_for(
+                    asyncio.to_thread(handler, tool_input),
+                    timeout=timeout,
+                )
+        else:
+            error = ToolNotFoundError(
+                f"No handler available for '{tool_name}'"
+            )
+
+    except asyncio.TimeoutError:
+        error = ToolTimeoutError(
+            f"Tool '{tool_name}' timed out after {timeout:.0f}s. "
+            f"The underlying operation may still be running."
+        )
+    except asyncio.CancelledError:
+        # Must propagate — gather uses this to cancel sibling tasks on Ctrl+C.
+        # We still emit post_tool_use so the UI shows the tool was interrupted.
+        if bus:
+            try:
+                bus.emit(
+                    "post_tool_use",
+                    tool=tool_name,
+                    input=tool_input,
+                    output=f"[CANCELLED] Tool '{tool_name}' was cancelled.",
+                )
+            except Exception:
+                pass
+        raise
+    except Exception as exc:
+        error = ToolExecutionError(tool_name, exc)
+
+    # ── Convert structured error to result dict ──
+    if error is not None:
+        result = error_to_result(tool_use_id, error)
+    else:
+        result = {
+            "type": "tool_result",
+            "tool_use_id": tool_use_id,
+            "content": str(output),
+        }
+
+    # ── Post-tool event (best-effort) ──
+    if bus:
+        try:
+            bus.emit(
+                "post_tool_use",
+                tool=tool_name,
+                input=tool_input,
+                output=result["content"][:1000],
+            )
+        except Exception:
+            pass  # Event errors must never affect tool results
+
+    # ── Truncate and display ──
+    console.print(result["content"][:300])
+
+    return result
+
+
 async def dispatch_tools(
     response_content: list,
     registry: ToolRegistry,
     bus: Optional[EventBus] = None,
     use_permissions: bool = True,
     mcp_executor: Optional[Callable] = None,
+    tool_timeout: float = DEFAULT_TOOL_TIMEOUT,
 ) -> List[Dict[str, Any]]:
-    """Process tool_use blocks from the model's response.
+    """Process tool_use blocks from the model's response concurrently.
+
+    Each independent tool_use block executes concurrently via asyncio.gather.
+    Failures in one tool do not affect sibling tools (error isolation).
+    Permission checks and hook blocks run synchronously before any tool
+    executes, so the model never waits for a tool that will be denied.
+
+    Error categories handled (in order of precedence):
+    1. Input validation  — wrong type → immediate error result
+    2. System hook block  — pre_tool_use returns {block: true} → immediate error
+    3. Permission denied  — policy rejects → immediate error
+    4. Unknown tool       — not in registry → immediate error
+    5. Tool timeout       — asyncio.wait_for expires → error, siblings continue
+    6. Tool crash         — handler raises Exception → error, siblings continue
+    7. User cancellation  — CancelledError → propagates, all tools cancelled
+
+    Resource conflict detection:
+    When multiple write/edit/revert tools target the same file path, the
+    dispatcher serializes those specific tools (within the concurrent batch)
+    to prevent last-write-wins data loss. Non-conflicting tools still run
+    concurrently.
 
     Args:
         response_content: Content blocks from the API response.
@@ -46,91 +303,175 @@ async def dispatch_tools(
         bus: Optional EventBus for pre/post_tool_use events.
         use_permissions: Whether to check permission rules.
         mcp_executor: Optional async callable for MCP tool invocation.
+        tool_timeout: Per-tool timeout in seconds (default 300s).
+
     Returns:
-        List of tool_result dicts to append to message history.
+        List of tool_result dicts in original tool_use block order,
+        suitable for appending to message history.
     """
-    results = []
     rules = load_rules() if use_permissions else None
 
-    for block in response_content:
-        if block.type != "tool_use":
+    # ── Phase 1: Classify all tool_use blocks ──────────────
+    # Each block gets a status: executable, blocked, denied, unknown, invalid_input
+    # Pre-computed error results avoid spawning tasks for doomed tools.
+
+    specs: List[tuple] = []  # (original_index, block, handler, status, error_msg)
+
+    for i, block in enumerate(response_content):
+        if getattr(block, "type", None) != "tool_use":
+            continue
+
+        status, error_msg, handler = _classify_tool_block(
+            block, registry, bus, rules, use_permissions, mcp_executor
+        )
+
+        if status == "executable":
+            first_val = _extract_input_summary(
+                block.input if isinstance(block.input, dict) else {}, block.name
+            )[:80]
+            console.print(f"[yellow]{block.name}[/yellow] {first_val}...")
+
+        specs.append((i, block, handler, status, error_msg))
+
+    if not specs:
+        return []
+
+    # ── Phase 2: Detect resource conflicts ─────────────────
+    # Tools modifying the same file are serialized within groups to
+    # prevent data races. Non-conflicting tools still run concurrently.
+
+    conflicting_paths = _detect_write_conflicts(
+        [(i, b, h, s, e) for i, b, h, s, e in specs if s == "executable"]
+    )
+
+    # ── Phase 3: Build concurrent execution plan ───────────
+    # We build a list of coroutines, one per executable tool.
+    # Error-isolated tools are gathered together; conflicting tools
+    # are chained sequentially within each conflict group.
+
+    # Map: original_index -> coroutine (or None for pre-computed errors)
+    coro_map: Dict[int, Any] = {}
+    # Track serialization chains: path -> list of (original_index, coroutine)
+    serial_groups: Dict[str, list] = {p: [] for p in conflicting_paths}
+
+    for i, block, handler, status, error_msg in specs:
+        if status != "executable":
             continue
 
         tool_name = block.name
-        tool_input = block.input
-        tool_use_id = block.id
+        tool_input = block.input if isinstance(block.input, dict) else {}
+        # Per-tool timeout from registry metadata, falling back to the dispatch-level default
+        per_tool_timeout = registry.get_timeout(tool_name, default=tool_timeout)
 
-        # ── Pre-tool event & permission check ────────────
-        first_val = _extract_input_summary(tool_input, tool_name)[:80]
-
-        if bus:
-            pre_results = bus.emit(
-                "pre_tool_use", tool=tool_name, input=tool_input
+        async def make_coro(tn=tool_name, ti=tool_input, tid=block.id, h=handler):
+            return await _execute_single_tool(
+                tool_name=tn,
+                tool_input=ti,
+                tool_use_id=tid,
+                handler=h,
+                mcp_executor=mcp_executor,
+                timeout=per_tool_timeout,
+                bus=bus,
             )
-            is_blocked = any(
-                r.get("block") for r in pre_results if isinstance(r, dict)
-            )
-            if is_blocked:
-                output = "Error: Execution blocked by system hook."
-                results.append({
-                    "type": "tool_result",
-                    "tool_use_id": tool_use_id,
-                    "content": output,
-                })
-                continue
 
-        if use_permissions:
-            check_str = _extract_input_summary(tool_input, tool_name)
-            allowed, reason = check_permission(tool_name, check_str, rules)
-            if not allowed:
-                console.print(f"[red][DENIED] {reason}[/red]")
-                output = (
-                    f"Blocked by Permission Policy: {check_str[:80]} "
-                    f"(Reason: {reason})"
-                )
-                results.append({
-                    "type": "tool_result",
-                    "tool_use_id": tool_use_id,
-                    "content": output,
-                })
-                continue
-
-        console.print(f"[yellow]{tool_name}[/yellow] {first_val}...")
-
-        # ── Execute tool ─────────────────────────────────
-        # MCP tools need async execution
-        if mcp_executor and tool_name.startswith("mcp__"):
-            try:
-                output = await mcp_executor(tool_name, tool_input)
-            except Exception as e:
-                output = f"Error during MCP execution: {e}"
+        # Check if this tool is part of a conflict group
+        target_path = tool_input.get("path", "") if isinstance(tool_input, dict) else ""
+        if target_path in conflicting_paths and block.name in {"write", "edit", "revert"}:
+            serial_groups[target_path].append((i, make_coro))
         else:
-            handler = registry.dispatch(tool_name)
-            if handler:
-                try:
-                    output = handler(tool_input)
-                except Exception as e:
-                    output = f"Error during tool execution: {e}"
+            coro_map[i] = make_coro
+
+    # ── Phase 4: Replace conflicting coroutines with serialized chains ──
+    for path, entries in serial_groups.items():
+        if not entries:
+            continue
+        if len(entries) == 1:
+            # Shouldn't happen (conflicting_paths filters for count > 1),
+            # but handle gracefully
+            idx, coro = entries[0]
+            coro_map[idx] = coro
+            continue
+
+        console.print(
+            f"[dim]  [concurrency] Serializing {len(entries)} tools "
+            f"targeting '{path}' to prevent write conflicts[/dim]"
+        )
+
+        async def serial_chain(ents=entries):
+            """Execute a chain of coroutines sequentially, returning all results."""
+            results = []
+            for _idx, coro_factory in ents:
+                result = await coro_factory()
+                results.append((_idx, result))
+            return results
+
+        # Replace individual coroutines with a single chained coroutine
+        first_idx = entries[0][0]
+        coro_map[first_idx] = serial_chain
+        for idx, _ in entries[1:]:
+            if idx in coro_map:
+                del coro_map[idx]
+
+    # ── Phase 5: Execute all coroutines concurrently ───────
+    coro_entries = sorted(coro_map.items(), key=lambda x: x[0])
+
+    try:
+        raw_results = await asyncio.gather(
+            *[c() for _, c in coro_entries],
+            return_exceptions=True,
+        )
+    except asyncio.CancelledError:
+        # CancelledError from gather: one of the tasks was cancelled
+        # (user interrupt). This propagates up to stream_loop which
+        # should handle it or let it bubble to the REPL.
+        raise
+    except KeyboardInterrupt:
+        # Belt-and-suspenders: KeyboardInterrupt during gather setup
+        raise
+
+    # ── Phase 6: Assemble final results (original order) ───
+    # Flatten results from both serial chains and independent tasks,
+    # maintaining original tool_use block ordering.
+
+    # Build a flat map: original_index -> result_dict
+    result_map: Dict[int, dict] = {}
+
+    for (orig_idx, _), raw in zip(coro_entries, raw_results):
+        if isinstance(raw, BaseException):
+            # A BaseException that escaped _execute_single_tool
+            # (typically CancelledError caught by return_exceptions=True)
+            result_map[orig_idx] = {
+                "type": "tool_result",
+                "tool_use_id": specs[orig_idx][1].id,
+                "content": f"Error: Tool execution interrupted: {raw}",
+            }
+        elif isinstance(raw, list):
+            # Serial chain result: list of (idx, result) tuples
+            for chain_idx, chain_result in raw:
+                result_map[chain_idx] = chain_result
+        else:
+            # Normal result dict from _execute_single_tool
+            result_map[orig_idx] = raw
+
+    # Assemble in original order — pre-computed errors use error_to_result()
+    # for consistent formatting with runtime errors from _execute_single_tool.
+    final_results = []
+    for i, block, handler, status, error_msg in specs:
+        if status == "executable":
+            if i in result_map:
+                final_results.append(result_map[i])
             else:
-                output = f"Error: Unknown tool '{tool_name}'"
+                # Fallback: should not happen, but guard against it
+                final_results.append({
+                    "type": "tool_result",
+                    "tool_use_id": block.id,
+                    "content": "Error: Tool result missing after dispatch.",
+                })
+        else:
+            # Pre-computed error — error_msg is a ToolError instance
+            final_results.append(error_to_result(block.id, error_msg))
 
-        console.print(output[:300])
-
-        if bus:
-            bus.emit(
-                "post_tool_use",
-                tool=tool_name,
-                input=tool_input,
-                output=str(output)[:1000],
-            )
-
-        results.append({
-            "type": "tool_result",
-            "tool_use_id": tool_use_id,
-            "content": str(output),
-        })
-
-    return results
+    return final_results
 
 
 async def stream_loop(
@@ -193,6 +534,9 @@ async def stream_loop(
                         input_tokens=response.usage.input_tokens or 0,
                         output_tokens=response.usage.output_tokens or 0,
                     )
+        except asyncio.CancelledError:
+            console.print("\n[yellow][Cancelled] User interrupted API call.[/yellow]")
+            raise
         except Exception as e:
             console.print(f"\n[red][Error] API call failed: {e}[/red]")
             raise
@@ -212,7 +556,16 @@ async def stream_loop(
         if response.stop_reason != "tool_use":
             return response
 
-        results = await dispatch_tools(
-            response.content, registry, _bus, _use_permissions, _mcp_executor
-        )
+        try:
+            results = await dispatch_tools(
+                response.content, registry, _bus, _use_permissions, _mcp_executor
+            )
+        except asyncio.CancelledError:
+            console.print(
+                "\n[yellow][Cancelled] Tool execution interrupted. "
+                "Saving partial results...[/yellow]"
+            )
+            # Re-raise so the REPL can handle the cancellation
+            raise
+
         messages.append({"role": "user", "content": results})

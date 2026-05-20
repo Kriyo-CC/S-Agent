@@ -1,6 +1,5 @@
 name: main
 description: "Personal AI secretary — structured data management, coding, and system automation"
-model: claude-sonnet-4-20250514
 allowed_tools:
   - bash
   - bash_shell
