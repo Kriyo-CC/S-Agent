@@ -14,3 +14,5 @@ dist/
 *.egg-info/
 *.txt
 .claude
+UserSpace/*
+!UserSpace/.formats.md
