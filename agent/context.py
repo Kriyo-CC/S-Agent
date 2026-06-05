@@ -14,7 +14,7 @@ from agent.types import AgentContext
 from cli.render import console
 
 COMPRESS_THRESHOLD = 40_000  # chars
-KEEP_RECENT = 6  # messages
+KEEP_RECENT = 20  # messages
 MEMORY_FILE = Path(".agent_memory.md")
 
 
