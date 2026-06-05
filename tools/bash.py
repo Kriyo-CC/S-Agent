@@ -9,7 +9,6 @@ Two tools are provided:
 import os
 import shlex
 import subprocess
-from typing import Dict, Any
 
 
 def run_bash(command: str) -> str:

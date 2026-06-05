@@ -4,7 +4,6 @@ Dynamically discovers tools from external MCP servers and registers them
 into the tool registry with namespaced names (mcp__<server>__<tool>).
 """
 
-import asyncio
 from contextlib import AsyncExitStack
 from pathlib import Path
 from typing import Dict, List, Tuple

@@ -3,10 +3,13 @@ __pycache__/
 *.pyc
 .venv/
 .sessions/
+.snapshots/
 .agent_memory.md
 .agent_tasks.json
 .mailboxes/
 .mcp_connections/
+.mypy_cache/
+.ruff_cache/
 dist/
 *.egg-info/
 *.txt

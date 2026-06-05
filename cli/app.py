@@ -45,7 +45,7 @@ except Exception:
 
 def _hook_stats():
     """Create a stats-tracking hook closure (tool usage counts)."""
-    counts = defaultdict(int)
+    counts: defaultdict[str, int] = defaultdict(int)
 
     def hook(event: str, **payload):
         if event == "session_start":

@@ -9,7 +9,6 @@ Tools:
   list_memories()         — List all stored memories
 """
 
-import os
 import re
 import time
 from pathlib import Path

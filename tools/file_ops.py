@@ -106,12 +106,16 @@ def run_grep(pattern: str, path: str = ".", recursive: bool = True) -> str:
 
     Uses ripgrep (rg) if available, falls back to system grep.
     """
-    recursive_flag = ["-r"] if recursive else []
+    grep_recursive_flag = ["-r"] if recursive else []
+    rg_args = ["rg", "-n"]
+    if not recursive:
+        rg_args.extend(["--max-depth", "1"])
 
-    # Try ripgrep first (faster, respects .gitignore)
+    # Try ripgrep first (faster, respects .gitignore). Unlike grep, rg is
+    # recursive by default; -r means replacement text, not recursive search.
     try:
         result = subprocess.run(
-            ["rg", "-n", *recursive_flag, pattern, path],
+            [*rg_args, pattern, path],
             capture_output=True,
             text=True,
             timeout=30,
@@ -128,7 +132,7 @@ def run_grep(pattern: str, path: str = ".", recursive: bool = True) -> str:
     # Fallback: system grep
     try:
         result = subprocess.run(
-            ["grep", "-n", *recursive_flag, pattern, path],
+            ["grep", "-n", *grep_recursive_flag, pattern, path],
             capture_output=True,
             text=True,
             timeout=30,

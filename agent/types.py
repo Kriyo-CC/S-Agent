@@ -5,7 +5,7 @@ everything the loop, tools, and CLI need, making it possible to mock or
 swap any component for testing.
 """
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional, Callable, Any
 
 from anthropic import Anthropic

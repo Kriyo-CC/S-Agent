@@ -25,18 +25,32 @@ from agent.accounting import SessionAccounting
 from cli.render import console
 from tools.registry import ToolRegistry
 from tools.errors import (
-    ToolTimeoutError,
+    ToolError,
     ToolExecutionError,
     ToolNotFoundError,
-    ToolPermissionDeniedError,
     ToolBlockedError,
     ToolInputValidationError,
+    ToolPermissionDeniedError,
+    ToolTimeoutError,
     error_to_result,
 )
 
 # ── Default per-tool timeout (generous safety net; internal tool
 #    timeouts like bash's 120s subprocess timeout fire first) ────
 DEFAULT_TOOL_TIMEOUT = 300.0  # seconds
+
+_CACHE_READ_FIELDS = (
+    "cache_read_input_tokens",
+    "input_cache_hit_tokens",
+    "cache_hit_input_tokens",
+    "prompt_cache_hit_tokens",
+)
+_CACHE_MISS_FIELDS = (
+    "cache_creation_input_tokens",
+    "input_cache_miss_tokens",
+    "cache_miss_input_tokens",
+    "prompt_cache_miss_tokens",
+)
 
 
 def _extract_input_summary(tool_input: dict, tool_name: str) -> str:
@@ -52,6 +66,33 @@ def _extract_input_summary(tool_input: dict, tool_name: str) -> str:
         if key in tool_input:
             return str(tool_input[key])
     return str(next(iter(tool_input.values())))
+
+
+def _usage_int(usage: Any, names: tuple[str, ...]) -> int:
+    """Return the first available integer usage field from an SDK object."""
+    for name in names:
+        value = getattr(usage, name, None)
+        if isinstance(value, int):
+            return value
+    return 0
+
+
+def _extract_billable_usage(usage: Any) -> tuple[int, int, int]:
+    """Extract cache-aware billable token counts from a response usage object.
+
+    Returns:
+        (cache_miss_input_tokens, cache_hit_input_tokens, output_tokens)
+
+    Anthropic-compatible usage exposes `input_tokens`, `output_tokens`,
+    `cache_creation_input_tokens`, and `cache_read_input_tokens`. DeepSeek
+    compatible gateways may use cache_hit/cache_miss aliases, so those are
+    checked as well.
+    """
+    input_tokens = int(getattr(usage, "input_tokens", 0) or 0)
+    output_tokens = int(getattr(usage, "output_tokens", 0) or 0)
+    cache_hit_tokens = _usage_int(usage, _CACHE_READ_FIELDS)
+    cache_miss_extra_tokens = _usage_int(usage, _CACHE_MISS_FIELDS)
+    return (input_tokens + cache_miss_extra_tokens, cache_hit_tokens, output_tokens)
 
 
 def _classify_tool_block(
@@ -74,7 +115,6 @@ def _classify_tool_block(
     """
     tool_name = block.name
     tool_input = block.input if isinstance(block.input, dict) else {}
-    tool_use_id = block.id
 
     # ── Input type validation ──
     if not isinstance(block.input, dict) and block.input is not None:
@@ -363,14 +403,20 @@ async def dispatch_tools(
         # Per-tool timeout from registry metadata, falling back to the dispatch-level default
         per_tool_timeout = registry.get_timeout(tool_name, default=tool_timeout)
 
-        async def make_coro(tn=tool_name, ti=tool_input, tid=block.id, h=handler):
+        async def make_coro(
+            tn=tool_name,
+            ti=tool_input,
+            tid=block.id,
+            h=handler,
+            timeout=per_tool_timeout,
+        ):
             return await _execute_single_tool(
                 tool_name=tn,
                 tool_input=ti,
                 tool_use_id=tid,
                 handler=h,
                 mcp_executor=mcp_executor,
-                timeout=per_tool_timeout,
+                timeout=timeout,
                 bus=bus,
             )
 
@@ -511,6 +557,8 @@ async def stream_loop(
 
     system = system or f"You are a coding agent at {os.getcwd()}. Use tools to solve tasks."
     extra_kwargs = extra_kwargs or {}
+    if _client is None:
+        raise RuntimeError("stream_loop requires an AgentContext with an Anthropic client.")
 
     while True:
         console.print("\n[cyan]> Thinking...[/cyan]")
@@ -530,9 +578,13 @@ async def stream_loop(
 
                 # Record token usage if accounting is active
                 if accounting and response.usage:
+                    input_tokens, cached_input_tokens, output_tokens = (
+                        _extract_billable_usage(response.usage)
+                    )
                     accounting.record_turn(
-                        input_tokens=response.usage.input_tokens or 0,
-                        output_tokens=response.usage.output_tokens or 0,
+                        input_tokens=input_tokens,
+                        cached_input_tokens=cached_input_tokens,
+                        output_tokens=output_tokens,
                     )
         except asyncio.CancelledError:
             console.print("\n[yellow][Cancelled] User interrupted API call.[/yellow]")

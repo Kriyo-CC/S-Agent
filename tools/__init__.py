@@ -18,15 +18,35 @@ from tools.subagent import register_subagent_tool
 # Re-export error types for convenience
 from tools.errors import (
     ToolError,
-    ToolTimeoutError,
+    ToolBlockedError,
     ToolExecutionError,
+    ToolInputValidationError,
     ToolNotFoundError,
     ToolPermissionDeniedError,
-    ToolBlockedError,
-    ToolInputValidationError,
-    is_transient,
+    ToolTimeoutError,
     error_to_result,
+    is_transient,
 )
+
+__all__ = [
+    "ToolRegistry",
+    "register_bash_tool",
+    "register_file_tools",
+    "register_ledger_tools",
+    "register_skill_tools",
+    "discover_skills",
+    "register_subagent_tool",
+    "ToolError",
+    "ToolBlockedError",
+    "ToolExecutionError",
+    "ToolInputValidationError",
+    "ToolNotFoundError",
+    "ToolPermissionDeniedError",
+    "ToolTimeoutError",
+    "error_to_result",
+    "is_transient",
+    "build_default_registry",
+]
 
 
 def build_default_registry() -> ToolRegistry:
